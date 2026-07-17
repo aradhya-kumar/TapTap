@@ -1,0 +1,1 @@
+self.callback_function = callback
