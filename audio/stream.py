@@ -10,7 +10,6 @@ class AudioStream:
         blocksize=512,
         device=1
     ):
-
         self.samplerate = samplerate
         self.channels = channels
         self.blocksize = blocksize
@@ -37,7 +36,7 @@ class AudioStream:
             channels=self.channels,
             blocksize=self.blocksize,
             dtype="float32",
-            callback=self._callback,
+            callback=self._callback
         )
 
         self.stream.start()
@@ -47,3 +46,4 @@ class AudioStream:
         if self.stream is not None:
             self.stream.stop()
             self.stream.close()
+            self.stream = None

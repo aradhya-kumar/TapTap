@@ -10,7 +10,7 @@ from audio.stream import AudioStream
 from dsp.features import extract
 
 
-class EchoDesk:
+class LiveTapClassifier:
 
     def __init__(
         self,
@@ -20,45 +20,47 @@ class EchoDesk:
         warmup_sec=2.0,
         threshold_multiplier=4.0,
         peak_multiplier=5.0,
-        cooldown_ms=400,
+        cooldown_ms=300,
     ):
 
         self.samplerate = samplerate
 
         # ==========================================
-        # Load models
+        # Load trained model
         # ==========================================
 
-        print()
-        print("Loading EchoDesk models...")
-
-        self.tap_model = joblib.load(
-            Path("models/tap_classifier.pkl")
+        model_path = Path(
+            "models/tap_classifier.pkl"
         )
 
-        self.tap_features = joblib.load(
-            Path(
-                "models/"
-                "tap_classifier_features.pkl"
+        feature_path = Path(
+            "models/tap_classifier_features.pkl"
+        )
+
+        if not model_path.exists():
+            raise FileNotFoundError(
+                "models/tap_classifier.pkl not found."
             )
-        )
 
-        self.location_model = joblib.load(
-            Path(
-                "models/"
-                "location_classifier.pkl"
+        if not feature_path.exists():
+            raise FileNotFoundError(
+                "models/tap_classifier_features.pkl not found."
             )
+
+        print("Loading tap classifier...")
+
+        self.model = joblib.load(
+            model_path
         )
 
-        self.location_features = joblib.load(
-            Path(
-                "models/"
-                "location_classifier_features.pkl"
-            )
+        self.feature_names = joblib.load(
+            feature_path
         )
 
-        print("Tap classifier loaded.")
-        print("Location classifier loaded.")
+        print(
+            f"Model loaded with "
+            f"{len(self.feature_names)} features."
+        )
 
         # ==========================================
         # Event window
@@ -82,10 +84,12 @@ class EchoDesk:
         )
 
         # ==========================================
-        # Candidate detection
+        # Detection configuration
         # ==========================================
 
-        self.warmup_sec = warmup_sec
+        self.warmup_sec = (
+            warmup_sec
+        )
 
         self.threshold_multiplier = (
             threshold_multiplier
@@ -101,7 +105,7 @@ class EchoDesk:
         )
 
         # ==========================================
-        # Calibration
+        # Noise calibration
         # ==========================================
 
         self.noise_rms_values = []
@@ -121,7 +125,7 @@ class EchoDesk:
         self.peak_threshold = None
 
         # ==========================================
-        # Pre-trigger ring buffer
+        # Pre-trigger buffer
         # ==========================================
 
         self.pre_buffer = deque(
@@ -129,7 +133,7 @@ class EchoDesk:
         )
 
         # ==========================================
-        # Event state
+        # Event collection
         # ==========================================
 
         self.collecting = False
@@ -138,55 +142,64 @@ class EchoDesk:
 
         self.samples_needed = 0
 
+        # ==========================================
+        # Timing
+        # ==========================================
+
         self.last_detection = 0
 
         # ==========================================
         # Statistics
         # ==========================================
 
-        self.total_candidates = 0
+        self.total_events = 0
 
-        self.valid_taps = 0
+        self.tap_events = 0
 
-        self.rejected_events = 0
-
-        self.left_taps = 0
-
-        self.right_taps = 0
+        self.not_tap_events = 0
 
     # ==============================================
-    # Audio callback
+    # Main audio callback
     # ==============================================
 
-    def process(self, audio):
+    def process(
+        self,
+        audio,
+    ):
 
         samples = (
             audio[:, 0]
-            .astype(np.float32)
+            .astype(
+                np.float32
+            )
         )
 
         # ------------------------------------------
-        # Calibration
+        # Initial calibration
         # ------------------------------------------
 
         if not self.calibrated:
 
-            self._learn_noise(samples)
+            self._learn_noise(
+                samples
+            )
 
             return
 
         # ------------------------------------------
-        # Continue current event
+        # Continue collecting event
         # ------------------------------------------
 
         if self.collecting:
 
-            self._collect_event(samples)
+            self._collect_event(
+                samples
+            )
 
             return
 
         # ------------------------------------------
-        # Calculate signal level
+        # Calculate current signal
         # ------------------------------------------
 
         rms = float(
@@ -199,41 +212,56 @@ class EchoDesk:
 
         peak = float(
             np.max(
-                np.abs(samples)
+                np.abs(
+                    samples
+                )
             )
+        )
+
+        # ------------------------------------------
+        # Cooldown
+        # ------------------------------------------
+
+        cooldown_active = (
+            time.time()
+            - self.last_detection
+            < self.cooldown_sec
         )
 
         # ------------------------------------------
         # Candidate detection
         # ------------------------------------------
 
-        cooldown_finished = (
-            time.time()
-            - self.last_detection
-            >= self.cooldown_sec
-        )
+        if not cooldown_active:
 
-        if (
-            cooldown_finished
-            and rms > self.rms_threshold
-            and peak > self.peak_threshold
-        ):
+            if (
+                rms > self.rms_threshold
+                and
+                peak > self.peak_threshold
+            ):
 
-            self._start_event(samples)
+                self._start_event(
+                    samples
+                )
 
-            return
+                return
 
         # ------------------------------------------
         # Update pre-trigger buffer
         # ------------------------------------------
 
-        self.pre_buffer.extend(samples)
+        self.pre_buffer.extend(
+            samples
+        )
 
     # ==============================================
-    # Noise calibration
+    # Initial noise calibration
     # ==============================================
 
-    def _learn_noise(self, samples):
+    def _learn_noise(
+        self,
+        samples,
+    ):
 
         rms = float(
             np.sqrt(
@@ -245,24 +273,37 @@ class EchoDesk:
 
         peak = float(
             np.max(
-                np.abs(samples)
+                np.abs(
+                    samples
+                )
             )
         )
 
-        self.noise_rms_values.append(rms)
+        self.noise_rms_values.append(
+            rms
+        )
 
-        self.noise_peak_values.append(peak)
+        self.noise_peak_values.append(
+            peak
+        )
 
-        self.warmup_samples += len(samples)
+        self.warmup_samples += len(
+            samples
+        )
 
-        self.pre_buffer.extend(samples)
+        self.pre_buffer.extend(
+            samples
+        )
 
-        required = int(
+        required_samples = int(
             self.samplerate
             * self.warmup_sec
         )
 
-        if self.warmup_samples >= required:
+        if (
+            self.warmup_samples
+            >= required_samples
+        ):
 
             self.noise_rms = float(
                 np.median(
@@ -292,7 +333,9 @@ class EchoDesk:
 
             print()
             print("=" * 60)
-            print("ECHODESK READY")
+            print(
+                "LIVE CLASSIFIER READY"
+            )
             print("=" * 60)
 
             print(
@@ -317,19 +360,23 @@ class EchoDesk:
 
             print()
             print(
-                "Listening for desk taps..."
+                "Listening for candidate events..."
             )
+
             print()
 
     # ==============================================
-    # Start event
+    # Start collecting event
     # ==============================================
 
-    def _start_event(self, samples):
+    def _start_event(
+        self,
+        samples,
+    ):
 
-        self.last_detection = time.time()
-
-        self.total_candidates += 1
+        self.last_detection = (
+            time.time()
+        )
 
         pre_audio = np.array(
             self.pre_buffer,
@@ -346,10 +393,15 @@ class EchoDesk:
 
         self.samples_needed = (
             self.event_samples
-            - len(self.event_buffer)
+            - len(
+                self.event_buffer
+            )
         )
 
-        if self.samples_needed <= 0:
+        if (
+            self.samples_needed
+            <= 0
+        ):
 
             self._finish_event()
 
@@ -358,12 +410,12 @@ class EchoDesk:
             self.collecting = True
 
     # ==============================================
-    # Continue event collection
+    # Collect remainder
     # ==============================================
 
     def _collect_event(
         self,
-        samples
+        samples,
     ):
 
         take = min(
@@ -377,26 +429,36 @@ class EchoDesk:
 
         self.samples_needed -= take
 
-        if self.samples_needed <= 0:
+        if (
+            self.samples_needed
+            <= 0
+        ):
 
             self._finish_event()
 
     # ==============================================
-    # Finish event
+    # Finish and classify event
     # ==============================================
 
-    def _finish_event(self):
+    def _finish_event(
+        self,
+    ):
 
         event = np.array(
             self.event_buffer,
             dtype=np.float32
         )
 
+        # Guarantee exact 90 ms
+
         event = event[
             :self.event_samples
         ]
 
-        if len(event) < self.event_samples:
+        if (
+            len(event)
+            < self.event_samples
+        ):
 
             event = np.pad(
                 event,
@@ -409,14 +471,24 @@ class EchoDesk:
 
         try:
 
-            self._analyze_event(event)
+            self._classify_event(
+                event
+            )
 
         except Exception as error:
 
+            print()
             print(
-                f"Classification error: "
-                f"{error}"
+                "Classification error:"
             )
+
+            print(
+                error
+            )
+
+            print()
+
+        # Reset collection state
 
         self.collecting = False
 
@@ -427,21 +499,25 @@ class EchoDesk:
         self.pre_buffer.clear()
 
     # ==============================================
-    # Flatten DSP features
+    # ML classification
     # ==============================================
 
-    def _build_feature_row(
+    def _classify_event(
         self,
-        event
+        event,
     ):
+
+        # Extract DSP features
 
         features = extract(
             event,
             self.samplerate
         )
 
-        row = {
+        # Convert nested feature output into
+        # same flat format used during training.
 
+        feature_row = {
             "rms":
                 features["rms"],
 
@@ -452,49 +528,31 @@ class EchoDesk:
                 features["energy"],
 
             "zero_crossings":
-                features[
-                    "zero_crossings"
-                ],
+                features["zero_crossings"],
 
             "crest_factor":
-                features[
-                    "crest_factor"
-                ],
+                features["crest_factor"],
 
             "peak_index":
-                features[
-                    "peak_index"
-                ],
+                features["peak_index"],
 
             "peak_position":
-                features[
-                    "peak_position"
-                ],
+                features["peak_position"],
 
             "attack_time":
-                features[
-                    "attack_time"
-                ],
+                features["attack_time"],
 
             "decay_ratio":
-                features[
-                    "decay_ratio"
-                ],
+                features["decay_ratio"],
 
             "centroid":
-                features[
-                    "centroid"
-                ],
+                features["centroid"],
 
             "bandwidth":
-                features[
-                    "bandwidth"
-                ],
+                features["bandwidth"],
 
             "rolloff":
-                features[
-                    "rolloff"
-                ],
+                features["rolloff"],
 
             "spectral_flatness":
                 features[
@@ -507,9 +565,7 @@ class EchoDesk:
                 ],
 
             "low_ratio":
-                features[
-                    "low_ratio"
-                ],
+                features["low_ratio"],
 
             "low_mid_ratio":
                 features[
@@ -517,14 +573,10 @@ class EchoDesk:
                 ],
 
             "mid_ratio":
-                features[
-                    "mid_ratio"
-                ],
+                features["mid_ratio"],
 
             "high_ratio":
-                features[
-                    "high_ratio"
-                ],
+                features["high_ratio"],
 
             "ultra_high_ratio":
                 features[
@@ -532,245 +584,172 @@ class EchoDesk:
                 ],
         }
 
+        # ------------------------------------------
         # MFCC means
+        # ------------------------------------------
 
         for i, value in enumerate(
             features["mfcc"]
         ):
 
-            row[
+            feature_row[
                 f"mfcc_mean_{i + 1}"
             ] = value
 
+        # ------------------------------------------
         # MFCC standard deviations
+        # ------------------------------------------
 
         for i, value in enumerate(
             features["mfcc_std"]
         ):
 
-            row[
+            feature_row[
                 f"mfcc_std_{i + 1}"
             ] = value
 
+        # ------------------------------------------
         # Delta MFCC
+        # ------------------------------------------
 
         for i, value in enumerate(
             features["mfcc_delta"]
         ):
 
-            row[
+            feature_row[
                 f"mfcc_delta_{i + 1}"
             ] = value
 
+        # ------------------------------------------
         # Delta-delta MFCC
+        # ------------------------------------------
 
         for i, value in enumerate(
             features["mfcc_delta2"]
         ):
 
-            row[
+            feature_row[
                 f"mfcc_delta2_{i + 1}"
             ] = value
 
-        return row
+        # ------------------------------------------
+        # Guarantee same feature order
+        # as training
+        # ------------------------------------------
 
-    # ==============================================
-    # Analyze event
-    # ==============================================
+        missing = [
+            feature
+            for feature
+            in self.feature_names
+            if feature
+            not in feature_row
+        ]
 
-    def _analyze_event(
-        self,
-        event
-    ):
+        if missing:
 
-        feature_row = (
-            self._build_feature_row(
-                event
+            raise ValueError(
+                "Missing features: "
+                + str(missing)
             )
-        )
 
-        # ==========================================
-        # Stage 1: Tap classifier
-        # ==========================================
-
-        tap_input = pd.DataFrame([
-            {
-                name:
+        X = pd.DataFrame(
+            [
+                {
+                    name:
                     feature_row[name]
 
-                for name
-                in self.tap_features
-            }
-        ])
+                    for name
+                    in self.feature_names
+                }
+            ]
+        )
 
-        tap_prediction = int(
-            self.tap_model.predict(
-                tap_input
+        # ------------------------------------------
+        # Prediction
+        # ------------------------------------------
+
+        prediction = int(
+            self.model.predict(
+                X
             )[0]
         )
 
-        # ------------------------------------------
-        # Get tap probability
-        # ------------------------------------------
+        # Get probability if supported
 
-        tap_probability = None
+        probability = None
 
         if hasattr(
-            self.tap_model,
+            self.model,
             "predict_proba"
         ):
 
             probabilities = (
-                self.tap_model.predict_proba(
-                    tap_input
+                self.model.predict_proba(
+                    X
                 )[0]
             )
 
             classes = list(
-                self.tap_model.classes_
+                self.model.classes_
             )
 
             if 1 in classes:
 
-                index = classes.index(1)
-
-                tap_probability = float(
-                    probabilities[index]
+                tap_index = (
+                    classes.index(1)
                 )
 
-        # ==========================================
-        # Reject non-tap
-        # ==========================================
+                probability = float(
+                    probabilities[
+                        tap_index
+                    ]
+                )
 
-        if tap_prediction != 1:
+        # ------------------------------------------
+        # Statistics
+        # ------------------------------------------
 
-            self.rejected_events += 1
+        self.total_events += 1
 
+        if prediction == 1:
+
+            self.tap_events += 1
+
+            print()
             print(
-                "NOT TAP → Ignored",
-                end=""
+                ">>> VALID TAP <<<"
             )
 
-            if tap_probability is not None:
+            if probability is not None:
 
                 print(
-                    f" "
-                    f"({tap_probability * 100:.1f}%)"
+                    f"Tap probability: "
+                    f"{probability * 100:.1f}%"
                 )
-
-            else:
-
-                print()
-
-            return
-
-        # ==========================================
-        # Valid tap
-        # ==========================================
-
-        self.valid_taps += 1
-
-        # ==========================================
-        # Stage 2: Location classifier
-        # ==========================================
-
-        location_input = pd.DataFrame([
-            {
-                name:
-                    feature_row[name]
-
-                for name
-                in self.location_features
-            }
-        ])
-
-        location = (
-            self.location_model.predict(
-                location_input
-            )[0]
-        )
-
-        # ------------------------------------------
-        # Location confidence
-        # ------------------------------------------
-
-        location_probability = None
-
-        if hasattr(
-            self.location_model,
-            "predict_proba"
-        ):
-
-            probabilities = (
-                self.location_model.predict_proba(
-                    location_input
-                )[0]
-            )
-
-            classes = list(
-                self.location_model.classes_
-            )
-
-            location_index = (
-                classes.index(location)
-            )
-
-            location_probability = float(
-                probabilities[
-                    location_index
-                ]
-            )
-
-        # ==========================================
-        # Output
-        # ==========================================
-
-        if location == "left":
-
-            self.left_taps += 1
-
-            print()
-            print(
-                "<<< LEFT TAP <<<"
-            )
-
-        elif location == "right":
-
-            self.right_taps += 1
-
-            print()
-            print(
-                ">>> RIGHT TAP >>>"
-            )
 
         else:
 
+            self.not_tap_events += 1
+
             print()
             print(
-                f"TAP: {location}"
+                "NOT TAP - ignored"
             )
 
-        if tap_probability is not None:
+            if probability is not None:
 
-            print(
-                f"Tap confidence: "
-                f"{tap_probability * 100:.1f}%"
-            )
-
-        if location_probability is not None:
-
-            print(
-                f"Location confidence: "
-                f"{location_probability * 100:.1f}%"
-            )
+                print(
+                    f"Tap probability: "
+                    f"{probability * 100:.1f}%"
+                )
 
         print(
-            f"Valid taps: "
-            f"{self.valid_taps} | "
-            f"Left: "
-            f"{self.left_taps} | "
-            f"Right: "
-            f"{self.right_taps}"
+            f"Events: "
+            f"{self.total_events} | "
+            f"Taps: "
+            f"{self.tap_events} | "
+            f"Ignored: "
+            f"{self.not_tap_events}"
         )
 
         print()
@@ -786,10 +765,7 @@ def main():
     print()
     print("=" * 60)
     print(
-        "EchoDesk"
-    )
-    print(
-        "Acoustic Surface Interaction System"
+        "EchoDesk Live ML Tap Classifier"
     )
     print("=" * 60)
 
@@ -799,19 +775,27 @@ def main():
         "2 seconds."
     )
 
-    echodesk = EchoDesk()
+    print()
 
-    stream = AudioStream()
+    classifier = (
+        LiveTapClassifier()
+    )
+
+    stream = (
+        AudioStream()
+    )
 
     stream.start(
-        echodesk.process
+        classifier.process
     )
 
     try:
 
         while True:
 
-            time.sleep(1)
+            time.sleep(
+                1
+            )
 
     except KeyboardInterrupt:
 
@@ -823,33 +807,23 @@ def main():
         stream.stop()
 
         print()
-        print("=" * 60)
-        print("SESSION SUMMARY")
-        print("=" * 60)
-
         print(
-            f"Candidate events: "
-            f"{echodesk.total_candidates}"
+            "Final statistics:"
         )
 
         print(
-            f"Rejected events: "
-            f"{echodesk.rejected_events}"
+            f"Candidate events: "
+            f"{classifier.total_events}"
         )
 
         print(
             f"Valid taps: "
-            f"{echodesk.valid_taps}"
+            f"{classifier.tap_events}"
         )
 
         print(
-            f"LEFT taps: "
-            f"{echodesk.left_taps}"
-        )
-
-        print(
-            f"RIGHT taps: "
-            f"{echodesk.right_taps}"
+            f"Ignored: "
+            f"{classifier.not_tap_events}"
         )
 
 
