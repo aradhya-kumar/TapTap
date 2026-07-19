@@ -2,9 +2,13 @@ import time
 from pathlib import Path
 from collections import deque
 
+import joblib
 import numpy as np
+import pandas as pd
 import sounddevice as sd
 import soundfile as sf
+
+from dsp.features import extract
 
 
 # ==========================================================
@@ -15,30 +19,44 @@ DEVICE = 1
 SAMPLERATE = 48000
 CHANNELS = 2
 
-# Audio captured before and after the detected tap
 PRE_MS = 20
 POST_MS = 100
 
-# Initial noise calibration
 CALIBRATION_SECONDS = 2.0
 
-# Detection sensitivity
 RMS_MULTIPLIER = 4.0
 PEAK_MULTIPLIER = 5.0
 
-# Minimum thresholds
 MIN_RMS_THRESHOLD = 0.0005
 MIN_PEAK_THRESHOLD = 0.002
 
-# Prevent one tap from being recorded multiple times
 COOLDOWN_SECONDS = 0.4
 
-# Audio block size
 BLOCKSIZE = 256
 
-# Storage location
+# Probability required before saving.
+# Start low because the current tap classifier
+# has imperfect recall.
+TAP_PROBABILITY_THRESHOLD = 0.50
+
+# Warn when signal is close to digital clipping.
+CLIPPING_THRESHOLD = 0.98
+
+
+# ==========================================================
+# PATHS
+# ==========================================================
+
 BASE_FOLDER = Path(
-    "data/stereo_location"
+    "data/filtered_stereo_location"
+)
+
+TAP_MODEL_PATH = Path(
+    "models/tap_classifier.pkl"
+)
+
+TAP_FEATURES_PATH = Path(
+    "models/tap_classifier_features.pkl"
 )
 
 ZONES = [
@@ -48,12 +66,50 @@ ZONES = [
 
 
 # ==========================================================
-# STEREO LOCATION COLLECTOR
+# COLLECTOR
 # ==========================================================
 
-class StereoLocationCollector:
+class FilteredStereoCollector:
 
     def __init__(self):
+
+        # --------------------------------------------------
+        # Load tap classifier
+        # --------------------------------------------------
+
+        print()
+        print("Loading tap classifier...")
+
+        if not TAP_MODEL_PATH.exists():
+
+            raise FileNotFoundError(
+                f"Model not found: "
+                f"{TAP_MODEL_PATH}"
+            )
+
+        if not TAP_FEATURES_PATH.exists():
+
+            raise FileNotFoundError(
+                f"Feature list not found: "
+                f"{TAP_FEATURES_PATH}"
+            )
+
+        self.tap_model = joblib.load(
+            TAP_MODEL_PATH
+        )
+
+        self.tap_feature_names = joblib.load(
+            TAP_FEATURES_PATH
+        )
+
+        print(
+            "Tap classifier loaded."
+        )
+
+        print(
+            f"Expected features: "
+            f"{len(self.tap_feature_names)}"
+        )
 
         # --------------------------------------------------
         # Create folders
@@ -70,7 +126,7 @@ class StereoLocationCollector:
             )
 
         # --------------------------------------------------
-        # Audio window sizes
+        # Event sizes
         # --------------------------------------------------
 
         self.pre_samples = int(
@@ -127,7 +183,7 @@ class StereoLocationCollector:
         self.last_detection = 0
 
         # --------------------------------------------------
-        # Zone
+        # Active label
         # --------------------------------------------------
 
         self.current_zone = None
@@ -146,8 +202,20 @@ class StereoLocationCollector:
                 )
             )
 
+        # --------------------------------------------------
+        # Session statistics
+        # --------------------------------------------------
+
+        self.candidates = 0
+
+        self.accepted_taps = 0
+
+        self.rejected_events = 0
+
+        self.clipped_events = 0
+
     # ======================================================
-    # Find next recording number
+    # Find next file number
     # ======================================================
 
     def get_next_number(
@@ -193,7 +261,7 @@ class StereoLocationCollector:
         return max(numbers) + 1
 
     # ======================================================
-    # Select active zone
+    # Select zone
     # ======================================================
 
     def set_zone(
@@ -207,15 +275,15 @@ class StereoLocationCollector:
         print("=" * 60)
 
         print(
-            f"NOW COLLECTING: "
-            f"{zone.upper()}"
+            f"COLLECTING FILTERED "
+            f"{zone.upper()} TAPS"
         )
 
         print("=" * 60)
 
         print()
         print(
-            "Tap repeatedly whenever you want."
+            "Tap naturally inside this zone."
         )
 
         print(
@@ -224,10 +292,10 @@ class StereoLocationCollector:
         )
 
         print()
-
         print(
-            "Press ENTER when finished "
-            "with this zone."
+            "Typing or other impulses may trigger "
+            "the detector, but the Tap SVM will "
+            "try to reject them."
         )
 
         print()
@@ -251,9 +319,6 @@ class StereoLocationCollector:
                 f"{status}"
             )
 
-        # Make a safe copy because
-        # sounddevice reuses its buffers.
-
         samples = (
             indata.copy()
             .astype(
@@ -261,24 +326,13 @@ class StereoLocationCollector:
             )
         )
 
-        # --------------------------------------------------
-        # Verify stereo
-        # --------------------------------------------------
-
         if (
             samples.ndim != 2
             or
             samples.shape[1] < 2
         ):
 
-            print(
-                "ERROR: Expected "
-                "2-channel audio."
-            )
-
             return
-
-        # Keep exactly two channels
 
         samples = samples[
             :,
@@ -298,7 +352,7 @@ class StereoLocationCollector:
             return
 
         # --------------------------------------------------
-        # Continue collecting current tap
+        # Continue active event
         # --------------------------------------------------
 
         if self.collecting:
@@ -310,18 +364,15 @@ class StereoLocationCollector:
             return
 
         # --------------------------------------------------
-        # Calculate combined detection signal
+        # Detection values
         # --------------------------------------------------
 
-        # We use the strongest microphone
-        # for candidate detection.
-
-        channel_1 = samples[
+        ch1 = samples[
             :,
             0
         ]
 
-        channel_2 = samples[
+        ch2 = samples[
             :,
             1
         ]
@@ -329,7 +380,7 @@ class StereoLocationCollector:
         rms_1 = float(
             np.sqrt(
                 np.mean(
-                    channel_1 ** 2
+                    ch1 ** 2
                 )
             )
         )
@@ -337,7 +388,7 @@ class StereoLocationCollector:
         rms_2 = float(
             np.sqrt(
                 np.mean(
-                    channel_2 ** 2
+                    ch2 ** 2
                 )
             )
         )
@@ -345,7 +396,7 @@ class StereoLocationCollector:
         peak_1 = float(
             np.max(
                 np.abs(
-                    channel_1
+                    ch1
                 )
             )
         )
@@ -353,7 +404,7 @@ class StereoLocationCollector:
         peak_2 = float(
             np.max(
                 np.abs(
-                    channel_2
+                    ch2
                 )
             )
         )
@@ -368,10 +419,6 @@ class StereoLocationCollector:
             peak_2
         )
 
-        # --------------------------------------------------
-        # Cooldown
-        # --------------------------------------------------
-
         cooldown_finished = (
             time.time()
             - self.last_detection
@@ -379,7 +426,7 @@ class StereoLocationCollector:
         )
 
         # --------------------------------------------------
-        # Detect candidate tap
+        # Candidate impulse
         # --------------------------------------------------
 
         if (
@@ -402,7 +449,7 @@ class StereoLocationCollector:
             return
 
         # --------------------------------------------------
-        # Update stereo history buffer
+        # Update stereo pre-buffer
         # --------------------------------------------------
 
         for sample in samples:
@@ -412,7 +459,7 @@ class StereoLocationCollector:
             )
 
     # ======================================================
-    # Noise calibration
+    # Calibration
     # ======================================================
 
     def learn_noise(
@@ -420,12 +467,12 @@ class StereoLocationCollector:
         samples
     ):
 
-        channel_1 = samples[
+        ch1 = samples[
             :,
             0
         ]
 
-        channel_2 = samples[
+        ch2 = samples[
             :,
             1
         ]
@@ -433,7 +480,7 @@ class StereoLocationCollector:
         rms_1 = float(
             np.sqrt(
                 np.mean(
-                    channel_1 ** 2
+                    ch1 ** 2
                 )
             )
         )
@@ -441,7 +488,7 @@ class StereoLocationCollector:
         rms_2 = float(
             np.sqrt(
                 np.mean(
-                    channel_2 ** 2
+                    ch2 ** 2
                 )
             )
         )
@@ -449,7 +496,7 @@ class StereoLocationCollector:
         peak_1 = float(
             np.max(
                 np.abs(
-                    channel_1
+                    ch1
                 )
             )
         )
@@ -457,7 +504,7 @@ class StereoLocationCollector:
         peak_2 = float(
             np.max(
                 np.abs(
-                    channel_2
+                    ch2
                 )
             )
         )
@@ -480,22 +527,20 @@ class StereoLocationCollector:
             samples
         )
 
-        # Store stereo history
-
         for sample in samples:
 
             self.pre_buffer.append(
                 sample.copy()
             )
 
-        required_samples = int(
+        required = int(
             SAMPLERATE
             * CALIBRATION_SECONDS
         )
 
         if (
             self.calibration_samples
-            >= required_samples
+            >= required
         ):
 
             noise_rms = float(
@@ -527,7 +572,7 @@ class StereoLocationCollector:
             print()
             print("=" * 60)
             print(
-                "STEREO MICROPHONE CALIBRATED"
+                "CALIBRATION COMPLETE"
             )
             print("=" * 60)
 
@@ -541,27 +586,20 @@ class StereoLocationCollector:
                 f"{noise_peak:.6f}"
             )
 
-            print()
-
             print(
-                f"RMS threshold: "
+                f"RMS Threshold: "
                 f"{self.rms_threshold:.6f}"
             )
 
             print(
-                f"Peak threshold: "
+                f"Peak Threshold: "
                 f"{self.peak_threshold:.6f}"
-            )
-
-            print()
-            print(
-                "Ready to collect taps."
             )
 
             print()
 
     # ======================================================
-    # Start tap event
+    # Start event
     # ======================================================
 
     def start_event(
@@ -573,7 +611,7 @@ class StereoLocationCollector:
             time.time()
         )
 
-        # Get stereo audio before trigger
+        self.candidates += 1
 
         if len(
             self.pre_buffer
@@ -589,13 +627,10 @@ class StereoLocationCollector:
             pre_audio = np.empty(
                 (
                     0,
-                    CHANNELS
+                    2
                 ),
                 dtype=np.float32
             )
-
-        # Combine pre-trigger audio
-        # and current block.
 
         event = np.concatenate(
             [
@@ -626,7 +661,7 @@ class StereoLocationCollector:
             self.collecting = True
 
     # ======================================================
-    # Continue collecting tap
+    # Continue event
     # ======================================================
 
     def collect_event(
@@ -655,7 +690,147 @@ class StereoLocationCollector:
             self.finish_event()
 
     # ======================================================
-    # Finish and save tap
+    # Build feature row for tap model
+    # ======================================================
+
+    def build_tap_feature_row(
+        self,
+        mono_event
+    ):
+
+        features = extract(
+            mono_event,
+            SAMPLERATE
+        )
+
+        row = {
+
+            "rms":
+                features["rms"],
+
+            "peak":
+                features["peak"],
+
+            "energy":
+                features["energy"],
+
+            "zero_crossings":
+                features[
+                    "zero_crossings"
+                ],
+
+            "crest_factor":
+                features[
+                    "crest_factor"
+                ],
+
+            "peak_index":
+                features[
+                    "peak_index"
+                ],
+
+            "peak_position":
+                features[
+                    "peak_position"
+                ],
+
+            "attack_time":
+                features[
+                    "attack_time"
+                ],
+
+            "decay_ratio":
+                features[
+                    "decay_ratio"
+                ],
+
+            "centroid":
+                features[
+                    "centroid"
+                ],
+
+            "bandwidth":
+                features[
+                    "bandwidth"
+                ],
+
+            "rolloff":
+                features[
+                    "rolloff"
+                ],
+
+            "spectral_flatness":
+                features[
+                    "spectral_flatness"
+                ],
+
+            "spectral_entropy":
+                features[
+                    "spectral_entropy"
+                ],
+
+            "low_ratio":
+                features[
+                    "low_ratio"
+                ],
+
+            "low_mid_ratio":
+                features[
+                    "low_mid_ratio"
+                ],
+
+            "mid_ratio":
+                features[
+                    "mid_ratio"
+                ],
+
+            "high_ratio":
+                features[
+                    "high_ratio"
+                ],
+
+            "ultra_high_ratio":
+                features[
+                    "ultra_high_ratio"
+                ],
+        }
+
+        for i, value in enumerate(
+            features["mfcc"]
+        ):
+
+            row[
+                f"mfcc_mean_{i + 1}"
+            ] = value
+
+        for i, value in enumerate(
+            features["mfcc_std"]
+        ):
+
+            row[
+                f"mfcc_std_{i + 1}"
+            ] = value
+
+        for i, value in enumerate(
+            features["mfcc_delta"]
+        ):
+
+            row[
+                f"mfcc_delta_{i + 1}"
+            ] = value
+
+        for i, value in enumerate(
+            features["mfcc_delta2"]
+        ):
+
+            row[
+                f"mfcc_delta2_{i + 1}"
+            ] = value
+
+        return row
+
+    # ======================================================
+    # Finish event
     # ======================================================
 
     def finish_event(
@@ -666,8 +841,6 @@ class StereoLocationCollector:
             self.event_buffer,
             axis=0
         )
-
-        # Guarantee exact length
 
         event = event[
             :self.event_samples,
@@ -692,32 +865,14 @@ class StereoLocationCollector:
                 )
             )
 
-        zone = self.current_zone
-
-        if zone is None:
-
-            self.reset_event()
-
-            return
-
         # --------------------------------------------------
-        # Calculate channel information
+        # Check clipping
         # --------------------------------------------------
-
-        channel_1 = event[
-            :,
-            0
-        ]
-
-        channel_2 = event[
-            :,
-            1
-        ]
 
         peak_1 = float(
             np.max(
                 np.abs(
-                    channel_1
+                    event[:, 0]
                 )
             )
         )
@@ -725,14 +880,174 @@ class StereoLocationCollector:
         peak_2 = float(
             np.max(
                 np.abs(
-                    channel_2
+                    event[:, 1]
                 )
             )
         )
 
+        clipping = (
+            peak_1
+            >= CLIPPING_THRESHOLD
+            or
+            peak_2
+            >= CLIPPING_THRESHOLD
+        )
+
+        if clipping:
+
+            self.clipped_events += 1
+
         # --------------------------------------------------
-        # Save stereo WAV
+        # Create mono COPY for existing tap classifier
+        #
+        # IMPORTANT:
+        # The original stereo event is preserved.
         # --------------------------------------------------
+
+        mono_event = np.mean(
+            event,
+            axis=1
+        ).astype(
+            np.float32
+        )
+
+        try:
+
+            feature_row = (
+                self.build_tap_feature_row(
+                    mono_event
+                )
+            )
+
+            # Build model input in EXACT
+            # training feature order.
+
+            model_input = pd.DataFrame([
+                {
+                    name:
+                        feature_row[name]
+
+                    for name
+                    in self.tap_feature_names
+                }
+            ])
+
+            # --------------------------------------------------
+            # Tap probability
+            # --------------------------------------------------
+
+            tap_probability = None
+
+            if hasattr(
+                self.tap_model,
+                "predict_proba"
+            ):
+
+                probabilities = (
+                    self.tap_model
+                    .predict_proba(
+                        model_input
+                    )[0]
+                )
+
+                classes = list(
+                    self.tap_model.classes_
+                )
+
+                if 1 in classes:
+
+                    tap_index = (
+                        classes.index(1)
+                    )
+
+                    tap_probability = float(
+                        probabilities[
+                            tap_index
+                        ]
+                    )
+
+            # --------------------------------------------------
+            # Decision
+            # --------------------------------------------------
+
+            if (
+                tap_probability
+                is not None
+            ):
+
+                is_tap = (
+                    tap_probability
+                    >=
+                    TAP_PROBABILITY_THRESHOLD
+                )
+
+            else:
+
+                prediction = int(
+                    self.tap_model.predict(
+                        model_input
+                    )[0]
+                )
+
+                is_tap = (
+                    prediction == 1
+                )
+
+        except Exception as error:
+
+            print()
+            print(
+                "Classification error:"
+            )
+
+            print(
+                error
+            )
+
+            self.reset_event()
+
+            return
+
+        # --------------------------------------------------
+        # Reject non-tap
+        # --------------------------------------------------
+
+        if not is_tap:
+
+            self.rejected_events += 1
+
+            if (
+                tap_probability
+                is not None
+            ):
+
+                print(
+                    f"REJECTED → NOT TAP "
+                    f"| Confidence: "
+                    f"{tap_probability * 100:.1f}%"
+                )
+
+            else:
+
+                print(
+                    "REJECTED → NOT TAP"
+                )
+
+            self.reset_event()
+
+            return
+
+        # --------------------------------------------------
+        # Valid tap
+        # --------------------------------------------------
+
+        zone = self.current_zone
+
+        if zone is None:
+
+            self.reset_event()
+
+            return
 
         number = (
             self.counters[
@@ -749,6 +1064,8 @@ class StereoLocationCollector:
             )
         )
 
+        # Save ORIGINAL STEREO audio
+
         sf.write(
             filename,
             event,
@@ -759,17 +1076,47 @@ class StereoLocationCollector:
             zone
         ] += 1
 
+        self.accepted_taps += 1
+
+        print()
+
         print(
             f"{zone.upper()} TAP SAVED "
-            f"#{self.counters[zone]} "
-            f"| CH1: {peak_1:.3f} "
-            f"| CH2: {peak_2:.3f}"
+            f"#{self.counters[zone]}"
         )
+
+        if (
+            tap_probability
+            is not None
+        ):
+
+            print(
+                f"Tap confidence: "
+                f"{tap_probability * 100:.1f}%"
+            )
+
+        print(
+            f"CH1 Peak: "
+            f"{peak_1:.3f}"
+        )
+
+        print(
+            f"CH2 Peak: "
+            f"{peak_2:.3f}"
+        )
+
+        if clipping:
+
+            print(
+                "WARNING: CLIPPING DETECTED"
+            )
+
+        print()
 
         self.reset_event()
 
     # ======================================================
-    # Reset event
+    # Reset
     # ======================================================
 
     def reset_event(
@@ -785,33 +1132,53 @@ class StereoLocationCollector:
         self.pre_buffer.clear()
 
     # ======================================================
-    # Show counts
+    # Statistics
     # ======================================================
 
-    def show_counts(
+    def show_stats(
         self
     ):
 
         print()
-        print("=" * 50)
-
+        print("=" * 60)
         print(
-            "STEREO LOCATION DATASET"
+            "FILTERED STEREO DATASET"
         )
-
-        print("=" * 50)
+        print("=" * 60)
 
         print(
-            f"LEFT: "
+            f"LEFT saved: "
             f"{self.counters['left']}"
         )
 
         print(
-            f"RIGHT: "
+            f"RIGHT saved: "
             f"{self.counters['right']}"
         )
 
-        print("=" * 50)
+        print()
+
+        print(
+            f"Candidate events: "
+            f"{self.candidates}"
+        )
+
+        print(
+            f"Accepted taps: "
+            f"{self.accepted_taps}"
+        )
+
+        print(
+            f"Rejected events: "
+            f"{self.rejected_events}"
+        )
+
+        print(
+            f"Clipping warnings: "
+            f"{self.clipped_events}"
+        )
+
+        print("=" * 60)
 
 
 # ==========================================================
@@ -824,15 +1191,11 @@ def main():
     print("=" * 60)
 
     print(
-        "EchoDesk Automatic "
-        "Stereo Tap Collector"
+        "EchoDesk Filtered "
+        "Stereo Location Collector"
     )
 
     print("=" * 60)
-
-    # ------------------------------------------------------
-    # Show microphone
-    # ------------------------------------------------------
 
     device_info = sd.query_devices(
         DEVICE,
@@ -855,25 +1218,17 @@ def main():
         f"{SAMPLERATE}"
     )
 
-    # ------------------------------------------------------
-    # Create collector
-    # ------------------------------------------------------
-
     collector = (
-        StereoLocationCollector()
+        FilteredStereoCollector()
     )
 
-    collector.show_counts()
+    collector.show_stats()
 
     print()
     print(
         "Stay quiet for "
-        "2 seconds while calibrating..."
+        "2 seconds..."
     )
-
-    # ------------------------------------------------------
-    # Start continuous stereo stream
-    # ------------------------------------------------------
 
     stream = sd.InputStream(
         device=DEVICE,
@@ -886,8 +1241,6 @@ def main():
 
     stream.start()
 
-    # Wait for calibration
-
     while (
         not collector.calibrated
     ):
@@ -895,10 +1248,6 @@ def main():
         time.sleep(
             0.1
         )
-
-    # ------------------------------------------------------
-    # Menu
-    # ------------------------------------------------------
 
     try:
 
@@ -918,7 +1267,7 @@ def main():
             )
 
             print(
-                "3 - Show counts"
+                "3 - Show statistics"
             )
 
             print(
@@ -957,7 +1306,7 @@ def main():
 
             elif choice == "3":
 
-                collector.show_counts()
+                collector.show_stats()
 
             elif choice == "q":
 
@@ -980,7 +1329,7 @@ def main():
             "Collection finished."
         )
 
-        collector.show_counts()
+        collector.show_stats()
 
 
 if __name__ == "__main__":
