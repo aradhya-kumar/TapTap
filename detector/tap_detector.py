@@ -2,6 +2,7 @@ import time
 from collections import deque
 from pathlib import Path
 
+# pyrefly: ignore [missing-import]
 import numpy as np
 import soundfile as sf
 

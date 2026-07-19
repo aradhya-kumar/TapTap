@@ -34,8 +34,6 @@ MIN_PEAK_THRESHOLD = 0.002
 
 COOLDOWN_SECONDS = 0.4
 
-# Minimum confidence required for the
-# existing tap classifier to accept an event.
 TAP_THRESHOLD = 0.50
 
 
@@ -74,7 +72,7 @@ class EchoDesk:
         print("=" * 60)
 
         # ==================================================
-        # LOAD TAP MODEL
+        # LOAD TAP CLASSIFIER
         # ==================================================
 
         self.tap_model = joblib.load(
@@ -90,7 +88,7 @@ class EchoDesk:
         )
 
         # ==================================================
-        # LOAD STEREO LOCATION MODEL
+        # LOAD STEREO LOCATION CLASSIFIER
         # ==================================================
 
         self.location_model = joblib.load(
@@ -186,6 +184,15 @@ class EchoDesk:
 
         self.right_taps = 0
 
+        # ==================================================
+        # LATEST PREDICTION RESULT
+        #
+        # This is used by diagnostics/test_live_location.py
+        # ==================================================
+
+        self.latest_result = None
+
+
     # ======================================================
     # AUDIO CALLBACK
     # ======================================================
@@ -201,8 +208,7 @@ class EchoDesk:
         if status:
 
             print(
-                f"Audio status: "
-                f"{status}"
+                f"Audio status: {status}"
             )
 
         samples = (
@@ -229,7 +235,7 @@ class EchoDesk:
 
             return
 
-        # Keep exactly two channels
+        # Keep first two microphone channels
 
         samples = samples[
             :,
@@ -261,7 +267,7 @@ class EchoDesk:
             return
 
         # ==================================================
-        # CANDIDATE DETECTION
+        # CANDIDATE IMPULSE DETECTION
         # ==================================================
 
         ch1 = samples[
@@ -322,10 +328,6 @@ class EchoDesk:
             >= COOLDOWN_SECONDS
         )
 
-        # --------------------------------------------------
-        # Candidate impulse
-        # --------------------------------------------------
-
         if (
             cooldown_finished
             and
@@ -351,6 +353,7 @@ class EchoDesk:
             self.pre_buffer.append(
                 sample.copy()
             )
+
 
     # ======================================================
     # NOISE CALIBRATION
@@ -403,29 +406,29 @@ class EchoDesk:
             )
         )
 
-        rms = max(
+        noise_rms = max(
             rms_1,
             rms_2
         )
 
-        peak = max(
+        noise_peak = max(
             peak_1,
             peak_2
         )
 
         self.noise_rms_values.append(
-            rms
+            noise_rms
         )
 
         self.noise_peak_values.append(
-            peak
+            noise_peak
         )
 
         self.calibration_samples += len(
             samples
         )
 
-        # Store stereo pre-trigger history
+        # Store audio history
 
         for sample in samples:
 
@@ -433,39 +436,37 @@ class EchoDesk:
                 sample.copy()
             )
 
-        required = int(
+        required_samples = int(
             SAMPLERATE
             * CALIBRATION_SECONDS
         )
 
         if (
             self.calibration_samples
-            >= required
+            >= required_samples
         ):
 
-            noise_rms = float(
+            baseline_rms = float(
                 np.median(
                     self.noise_rms_values
                 )
             )
 
-            noise_peak = float(
+            baseline_peak = float(
                 np.median(
                     self.noise_peak_values
                 )
             )
 
             self.rms_threshold = max(
-                noise_rms
+                baseline_rms
                 * RMS_MULTIPLIER,
-
                 MIN_RMS_THRESHOLD
             )
 
             self.peak_threshold = max(
-                noise_peak
+                baseline_peak
                 * PEAK_MULTIPLIER,
-
                 MIN_PEAK_THRESHOLD
             )
 
@@ -480,12 +481,12 @@ class EchoDesk:
 
             print(
                 f"Noise RMS: "
-                f"{noise_rms:.6f}"
+                f"{baseline_rms:.6f}"
             )
 
             print(
                 f"Noise Peak: "
-                f"{noise_peak:.6f}"
+                f"{baseline_peak:.6f}"
             )
 
             print(
@@ -502,8 +503,8 @@ class EchoDesk:
             print(
                 "Listening for taps..."
             )
-
             print()
+
 
     # ======================================================
     # START EVENT
@@ -520,8 +521,12 @@ class EchoDesk:
 
         self.candidates += 1
 
+        # Reset previous prediction
+
+        self.latest_result = None
+
         # --------------------------------------------------
-        # Retrieve stereo pre-trigger audio
+        # Get pre-trigger audio
         # --------------------------------------------------
 
         if len(
@@ -544,7 +549,7 @@ class EchoDesk:
             )
 
         # --------------------------------------------------
-        # Combine history with trigger block
+        # Combine pre-trigger and trigger block
         # --------------------------------------------------
 
         event = np.concatenate(
@@ -575,8 +580,9 @@ class EchoDesk:
 
             self.collecting = True
 
+
     # ======================================================
-    # CONTINUE EVENT
+    # COLLECT REMAINING EVENT AUDIO
     # ======================================================
 
     def collect_event(
@@ -604,8 +610,9 @@ class EchoDesk:
 
             self.finish_event()
 
+
     # ======================================================
-    # BUILD TAP CLASSIFIER FEATURES
+    # BUILD TAP FEATURES
     # ======================================================
 
     def build_tap_features(
@@ -711,7 +718,7 @@ class EchoDesk:
         }
 
         # --------------------------------------------------
-        # MFCC means
+        # MFCC MEAN
         # --------------------------------------------------
 
         for i, value in enumerate(
@@ -723,7 +730,7 @@ class EchoDesk:
             ] = value
 
         # --------------------------------------------------
-        # MFCC standard deviations
+        # MFCC STD
         # --------------------------------------------------
 
         for i, value in enumerate(
@@ -735,7 +742,7 @@ class EchoDesk:
             ] = value
 
         # --------------------------------------------------
-        # MFCC delta
+        # MFCC DELTA
         # --------------------------------------------------
 
         for i, value in enumerate(
@@ -747,7 +754,7 @@ class EchoDesk:
             ] = value
 
         # --------------------------------------------------
-        # MFCC delta-delta
+        # MFCC DELTA-DELTA
         # --------------------------------------------------
 
         for i, value in enumerate(
@@ -760,6 +767,7 @@ class EchoDesk:
 
         return row
 
+
     # ======================================================
     # FINISH AND ANALYZE EVENT
     # ======================================================
@@ -768,11 +776,16 @@ class EchoDesk:
         self
     ):
 
+        # Important:
+        # Rejected events must not keep an old result.
+
+        self.latest_result = None
+
         try:
 
-            # ==============================================
+            # ==================================================
             # BUILD STEREO EVENT
-            # ==============================================
+            # ==================================================
 
             event = np.concatenate(
                 self.event_buffer,
@@ -784,7 +797,9 @@ class EchoDesk:
                 :2
             ]
 
-            # Pad if required
+            # --------------------------------------------------
+            # Pad short events
+            # --------------------------------------------------
 
             if (
                 len(event)
@@ -799,14 +814,20 @@ class EchoDesk:
                 event = np.pad(
                     event,
                     (
-                        (0, missing),
-                        (0, 0)
+                        (
+                            0,
+                            missing
+                        ),
+                        (
+                            0,
+                            0
+                        )
                     )
                 )
 
-            # ==============================================
-            # MONO COPY FOR TAP CLASSIFIER
-            # ==============================================
+            # ==================================================
+            # CREATE MONO VERSION FOR TAP CLASSIFIER
+            # ==================================================
 
             mono = np.mean(
                 event,
@@ -815,9 +836,9 @@ class EchoDesk:
                 np.float32
             )
 
-            # ==============================================
+            # ==================================================
             # EXTRACT TAP FEATURES
-            # ==============================================
+            # ==================================================
 
             tap_features = (
                 self.build_tap_features(
@@ -827,6 +848,7 @@ class EchoDesk:
 
             tap_input = pd.DataFrame([
                 {
+
                     name:
                         tap_features[
                             name
@@ -834,12 +856,13 @@ class EchoDesk:
 
                     for name
                     in self.tap_feature_names
+
                 }
             ])
 
-            # ==============================================
-            # TAP PROBABILITY
-            # ==============================================
+            # ==================================================
+            # TAP CLASSIFICATION
+            # ==================================================
 
             tap_probability = None
 
@@ -859,6 +882,8 @@ class EchoDesk:
                     self.tap_model.classes_
                 )
 
+                # Handle numeric binary classifier
+
                 if 1 in classes:
 
                     tap_index = (
@@ -873,9 +898,25 @@ class EchoDesk:
                         ]
                     )
 
-            # ==============================================
+                # Handle string label classifier
+
+                elif "tap" in classes:
+
+                    tap_index = (
+                        classes.index(
+                            "tap"
+                        )
+                    )
+
+                    tap_probability = float(
+                        probabilities[
+                            tap_index
+                        ]
+                    )
+
+            # ==================================================
             # TAP DECISION
-            # ==============================================
+            # ==================================================
 
             if (
                 tap_probability
@@ -895,16 +936,28 @@ class EchoDesk:
                     )[0]
                 )
 
-                is_tap = (
-                    int(
-                        prediction
-                    )
-                    == 1
-                )
+                if isinstance(
+                    prediction,
+                    str
+                ):
 
-            # ==============================================
+                    is_tap = (
+                        prediction.lower()
+                        == "tap"
+                    )
+
+                else:
+
+                    is_tap = (
+                        int(
+                            prediction
+                        )
+                        == 1
+                    )
+
+            # ==================================================
             # REJECT NON-TAP
-            # ==============================================
+            # ==================================================
 
             if not is_tap:
 
@@ -916,27 +969,27 @@ class EchoDesk:
                 ):
 
                     print(
-                        f"NOT TAP → Ignored "
+                        f"NOT TAP -> Ignored "
                         f"({tap_probability * 100:.1f}%)"
                     )
 
                 else:
 
                     print(
-                        "NOT TAP → Ignored"
+                        "NOT TAP -> Ignored"
                     )
 
                 return
 
-            # ==============================================
+            # ==================================================
             # VALID TAP
-            # ==============================================
+            # ==================================================
 
             self.valid_taps += 1
 
-            # ==============================================
+            # ==================================================
             # EXTRACT STEREO SPATIAL FEATURES
-            # ==============================================
+            # ==================================================
 
             spatial_features = (
                 extract_stereo_features(
@@ -947,6 +1000,7 @@ class EchoDesk:
 
             location_input = pd.DataFrame([
                 {
+
                     name:
                         spatial_features[
                             name
@@ -954,24 +1008,32 @@ class EchoDesk:
 
                     for name
                     in self.location_feature_names
+
                 }
             ])
 
-            # ==============================================
+            # ==================================================
             # LOCATION PREDICTION
-            # ==============================================
+            # ==================================================
 
             location = (
-                self.location_model.predict(
+                self.location_model
+                .predict(
                     location_input
                 )[0]
             )
 
-            # ==============================================
-            # LOCATION CONFIDENCE
-            # ==============================================
+            location = str(
+                location
+            ).lower()
 
-            location_probability = None
+            # ==================================================
+            # LOCATION PROBABILITIES
+            # ==================================================
+
+            left_probability = None
+
+            right_probability = None
 
             if hasattr(
                 self.location_model,
@@ -985,25 +1047,104 @@ class EchoDesk:
                     )[0]
                 )
 
-                classes = list(
-                    self.location_model.classes_
-                )
+                classes = [
 
-                location_index = (
-                    classes.index(
-                        location
+                    str(
+                        item
+                    ).lower()
+
+                    for item
+                    in self.location_model.classes_
+
+                ]
+
+                if "left" in classes:
+
+                    left_index = (
+                        classes.index(
+                            "left"
+                        )
                     )
+
+                    left_probability = float(
+                        probabilities[
+                            left_index
+                        ]
+                    )
+
+                if "right" in classes:
+
+                    right_index = (
+                        classes.index(
+                            "right"
+                        )
+                    )
+
+                    right_probability = float(
+                        probabilities[
+                            right_index
+                        ]
+                    )
+
+            # ==================================================
+            # PREDICTED LOCATION CONFIDENCE
+            # ==================================================
+
+            location_probability = None
+
+            if (
+                location == "left"
+                and
+                left_probability
+                is not None
+            ):
+
+                location_probability = (
+                    left_probability
                 )
 
-                location_probability = float(
-                    probabilities[
-                        location_index
-                    ]
+            elif (
+                location == "right"
+                and
+                right_probability
+                is not None
+            ):
+
+                location_probability = (
+                    right_probability
                 )
 
-            # ==============================================
-            # SAVE TO CSV LOG
-            # ==============================================
+            # ==================================================
+            # SAVE STRUCTURED RESULT
+            #
+            # test_live_location.py reads this.
+            # ==================================================
+
+            self.latest_result = {
+
+                "prediction":
+                    location,
+
+                "tap_probability":
+                    tap_probability,
+
+                "location_probability":
+                    location_probability,
+
+                "left_probability":
+                    left_probability,
+
+                "right_probability":
+                    right_probability,
+
+                "spatial_features":
+                    spatial_features.copy(),
+
+            }
+
+            # ==================================================
+            # LIVE CSV LOGGER
+            # ==================================================
 
             self.logger.log(
 
@@ -1021,11 +1162,9 @@ class EchoDesk:
 
             )
 
-            # ==============================================
-            # DISPLAY RESULT
-            # ==============================================
-
-            print()
+            # ==================================================
+            # UPDATE COUNTERS
+            # ==================================================
 
             if (
                 location
@@ -1033,6 +1172,24 @@ class EchoDesk:
             ):
 
                 self.left_taps += 1
+
+            elif (
+                location
+                == "right"
+            ):
+
+                self.right_taps += 1
+
+            # ==================================================
+            # DISPLAY RESULT
+            # ==================================================
+
+            print()
+
+            if (
+                location
+                == "left"
+            ):
 
                 print(
                     "<<< LEFT TAP <<<"
@@ -1043,8 +1200,6 @@ class EchoDesk:
                 == "right"
             ):
 
-                self.right_taps += 1
-
                 print(
                     ">>> RIGHT TAP >>>"
                 )
@@ -1052,13 +1207,13 @@ class EchoDesk:
             else:
 
                 print(
-                    f"TAP: "
-                    f"{location}"
+                    f"TAP LOCATION: "
+                    f"{location.upper()}"
                 )
 
-            # ==============================================
-            # CONFIDENCE
-            # ==============================================
+            # --------------------------------------------------
+            # Tap confidence
+            # --------------------------------------------------
 
             if (
                 tap_probability
@@ -1070,54 +1225,103 @@ class EchoDesk:
                     f"{tap_probability * 100:.1f}%"
                 )
 
+            # --------------------------------------------------
+            # Location probabilities
+            # --------------------------------------------------
+
             if (
-                location_probability
+                left_probability
                 is not None
             ):
 
                 print(
-                    f"Location confidence: "
-                    f"{location_probability * 100:.1f}%"
+                    f"LEFT probability: "
+                    f"{left_probability * 100:.1f}%"
                 )
 
-            # ==============================================
-            # SPATIAL DIAGNOSTICS
-            # ==============================================
+            if (
+                right_probability
+                is not None
+            ):
 
-            print(
-                f"RMS ratio: "
-                f"{spatial_features['log_rms_ratio']:.3f}"
-            )
+                print(
+                    f"RIGHT probability: "
+                    f"{right_probability * 100:.1f}%"
+                )
 
-            print(
-                f"Energy ratio: "
-                f"{spatial_features['log_energy_ratio']:.3f}"
-            )
+            # --------------------------------------------------
+            # Stereo diagnostics
+            # --------------------------------------------------
 
-            print(
-                f"Peak difference: "
-                f"{spatial_features['peak_difference']:.3f}"
-            )
+            if (
+                "log_rms_ratio"
+                in spatial_features
+            ):
 
-            print(
-                f"Peak sample difference: "
-                f"{spatial_features['peak_sample_difference']}"
-            )
+                print(
+                    f"RMS ratio: "
+                    f"{spatial_features['log_rms_ratio']:.3f}"
+                )
 
-            print(
-                f"Correlation lag: "
-                f"{spatial_features['correlation_lag']}"
-            )
+            if (
+                "log_energy_ratio"
+                in spatial_features
+            ):
 
-            print(
-                f"Correlation value: "
-                f"{spatial_features['correlation_value']:.3f}"
-            )
+                print(
+                    f"Energy ratio: "
+                    f"{spatial_features['log_energy_ratio']:.3f}"
+                )
 
-            print(
-                f"Channel correlation: "
-                f"{spatial_features['channel_correlation']:.3f}"
-            )
+            if (
+                "peak_difference"
+                in spatial_features
+            ):
+
+                print(
+                    f"Peak difference: "
+                    f"{spatial_features['peak_difference']:.3f}"
+                )
+
+            if (
+                "peak_sample_difference"
+                in spatial_features
+            ):
+
+                print(
+                    f"Peak sample difference: "
+                    f"{spatial_features['peak_sample_difference']}"
+                )
+
+            if (
+                "correlation_lag"
+                in spatial_features
+            ):
+
+                print(
+                    f"Correlation lag: "
+                    f"{spatial_features['correlation_lag']}"
+                )
+
+            if (
+                "correlation_value"
+                in spatial_features
+            ):
+
+                print(
+                    f"Correlation value: "
+                    f"{spatial_features['correlation_value']:.3f}"
+                )
+
+            if (
+                "channel_correlation"
+                in spatial_features
+            ):
+
+                print(
+                    f"Channel correlation: "
+                    f"{spatial_features['channel_correlation']:.3f}"
+                )
 
             print()
 
@@ -1136,18 +1340,27 @@ class EchoDesk:
 
         except Exception as error:
 
+            # Prevent the sounddevice callback
+            # from dying silently.
+
             print()
+            print("=" * 60)
             print(
-                "ERROR PROCESSING EVENT:"
+                "ERROR PROCESSING EVENT"
             )
+            print("=" * 60)
 
             print(
-                error
+                f"{type(error).__name__}: "
+                f"{error}"
             )
+
+            print()
 
         finally:
 
             self.reset_event()
+
 
     # ======================================================
     # RESET EVENT
@@ -1199,7 +1412,7 @@ def main():
     )
 
     print(
-        f"Channels: "
+        f"Channels requested: "
         f"{CHANNELS}"
     )
 
@@ -1209,7 +1422,7 @@ def main():
     )
 
     # ======================================================
-    # CREATE SYSTEM
+    # CREATE ECHODESK
     # ======================================================
 
     echodesk = EchoDesk()
@@ -1217,7 +1430,7 @@ def main():
     print()
     print(
         "Stay quiet for "
-        "2 seconds..."
+        "2 seconds during calibration..."
     )
 
     # ======================================================
@@ -1310,7 +1523,7 @@ def main():
         print()
 
         print(
-            "Prediction log saved to:"
+            "Live prediction log:"
         )
 
         print(

@@ -18,14 +18,14 @@ from main import (
 # CONFIGURATION
 # ==========================================================
 
-TEST_LOG_FOLDER = Path("logs")
+LOG_FOLDER = Path("logs")
 
-TEST_LOG_FILE = (
-    TEST_LOG_FOLDER
+LOG_FILE = (
+    LOG_FOLDER
     / "location_test_results.csv"
 )
 
-TEST_LOG_FOLDER.mkdir(
+LOG_FOLDER.mkdir(
     parents=True,
     exist_ok=True
 )
@@ -35,7 +35,7 @@ TEST_LOG_FOLDER.mkdir(
 # TEST LOGGER
 # ==========================================================
 
-class LocationTestLogger:
+class TestLogger:
 
     def __init__(self):
 
@@ -46,6 +46,8 @@ class LocationTestLogger:
             "correct",
             "tap_probability",
             "location_probability",
+            "left_probability",
+            "right_probability",
             "log_rms_ratio",
             "log_energy_ratio",
             "peak_difference",
@@ -55,10 +57,12 @@ class LocationTestLogger:
             "channel_correlation",
         ]
 
-        if not TEST_LOG_FILE.exists():
+        # Create CSV if it does not exist
+
+        if not LOG_FILE.exists():
 
             with open(
-                TEST_LOG_FILE,
+                LOG_FILE,
                 "w",
                 newline="",
                 encoding="utf-8"
@@ -71,18 +75,27 @@ class LocationTestLogger:
 
                 writer.writeheader()
 
+    # ======================================================
+    # LOG RESULT
+    # ======================================================
+
     def log(
         self,
         actual_location,
-        predicted_location,
-        tap_probability,
-        location_probability,
-        spatial_features
+        result
     ):
 
+        prediction = result[
+            "prediction"
+        ]
+
+        spatial = result[
+            "spatial_features"
+        ]
+
         correct = (
-            actual_location
-            == predicted_location
+            prediction
+            == actual_location
         )
 
         row = {
@@ -94,55 +107,69 @@ class LocationTestLogger:
                 actual_location,
 
             "predicted_location":
-                predicted_location,
+                prediction,
 
             "correct":
                 correct,
 
             "tap_probability":
-                tap_probability,
+                result.get(
+                    "tap_probability"
+                ),
 
             "location_probability":
-                location_probability,
+                result.get(
+                    "location_probability"
+                ),
+
+            "left_probability":
+                result.get(
+                    "left_probability"
+                ),
+
+            "right_probability":
+                result.get(
+                    "right_probability"
+                ),
 
             "log_rms_ratio":
-                spatial_features.get(
+                spatial.get(
                     "log_rms_ratio"
                 ),
 
             "log_energy_ratio":
-                spatial_features.get(
+                spatial.get(
                     "log_energy_ratio"
                 ),
 
             "peak_difference":
-                spatial_features.get(
+                spatial.get(
                     "peak_difference"
                 ),
 
             "peak_sample_difference":
-                spatial_features.get(
+                spatial.get(
                     "peak_sample_difference"
                 ),
 
             "correlation_lag":
-                spatial_features.get(
+                spatial.get(
                     "correlation_lag"
                 ),
 
             "correlation_value":
-                spatial_features.get(
+                spatial.get(
                     "correlation_value"
                 ),
 
             "channel_correlation":
-                spatial_features.get(
+                spatial.get(
                     "channel_correlation"
                 ),
         }
 
         with open(
-            TEST_LOG_FILE,
+            LOG_FILE,
             "a",
             newline="",
             encoding="utf-8"
@@ -171,15 +198,23 @@ class EchoDeskTest(
         actual_location
     ):
 
+        # Initialize main EchoDesk first
+
         super().__init__()
+
+        # Actual side being tested
 
         self.actual_location = (
             actual_location
         )
 
+        # Detailed test logger
+
         self.test_logger = (
-            LocationTestLogger()
+            TestLogger()
         )
+
+        # Test statistics
 
         self.test_total = 0
 
@@ -187,111 +222,87 @@ class EchoDeskTest(
 
         self.test_wrong = 0
 
-        self.last_logged_valid_taps = 0
-
-        self.last_left_count = 0
-
-        self.last_right_count = 0
 
     # ======================================================
-    # WATCH FOR NEW PREDICTIONS
+    # PROCESS EVENT
     # ======================================================
 
     def finish_event(
         self
     ):
 
-        # Save counters before
-        # parent processes event
-
-        old_valid = (
-            self.valid_taps
-        )
-
-        old_left = (
-            self.left_taps
-        )
-
-        old_right = (
-            self.right_taps
-        )
-
-        # Run normal EchoDesk pipeline
+        # Run normal EchoDesk processing first
 
         super().finish_event()
 
         # --------------------------------------------------
-        # Check if a valid tap was detected
+        # If event was rejected as NOT TAP,
+        # latest_result will be None.
         # --------------------------------------------------
 
         if (
-            self.valid_taps
-            == old_valid
+            self.latest_result
+            is None
         ):
 
             return
 
-        # --------------------------------------------------
-        # Determine prediction from counters
-        # --------------------------------------------------
+        result = (
+            self.latest_result
+        )
 
-        if (
-            self.left_taps
-            > old_left
-        ):
-
-            prediction = (
-                "left"
-            )
-
-        elif (
-            self.right_taps
-            > old_right
-        ):
-
-            prediction = (
-                "right"
-            )
-
-        else:
-
-            return
-
-        self.test_total += 1
-
-        # --------------------------------------------------
-        # Accuracy
-        # --------------------------------------------------
+        prediction = (
+            result[
+                "prediction"
+            ]
+        )
 
         correct = (
             prediction
             == self.actual_location
         )
 
+        # --------------------------------------------------
+        # Update statistics
+        # --------------------------------------------------
+
+        self.test_total += 1
+
         if correct:
 
             self.test_correct += 1
-
-            result = (
-                "CORRECT"
-            )
 
         else:
 
             self.test_wrong += 1
 
-            result = (
-                "WRONG"
-            )
+        # --------------------------------------------------
+        # Save detailed result
+        # --------------------------------------------------
+
+        self.test_logger.log(
+            self.actual_location,
+            result
+        )
+
+        # --------------------------------------------------
+        # Calculate accuracy
+        # --------------------------------------------------
+
+        accuracy = (
+
+            self.test_correct
+            / self.test_total
+            * 100
+
+        )
 
         # --------------------------------------------------
         # Display result
         # --------------------------------------------------
 
         print()
-        print(
-            "-" * 60
-        )
+        print("-" * 60)
 
         print(
             f"ACTUAL:    "
@@ -303,22 +314,32 @@ class EchoDeskTest(
             f"{prediction.upper()}"
         )
 
-        print(
-            f"RESULT:    "
-            f"{result}"
-        )
+        if correct:
 
-        accuracy = (
-            self.test_correct
-            / self.test_total
-            * 100
-        )
+            print(
+                "RESULT:    CORRECT"
+            )
+
+        else:
+
+            print(
+                "RESULT:    WRONG"
+            )
 
         print()
+
         print(
-            f"TEST SCORE: "
+            f"CORRECT: "
             f"{self.test_correct}"
-            f"/"
+        )
+
+        print(
+            f"WRONG:   "
+            f"{self.test_wrong}"
+        )
+
+        print(
+            f"TOTAL:   "
             f"{self.test_total}"
         )
 
@@ -327,13 +348,11 @@ class EchoDeskTest(
             f"{accuracy:.1f}%"
         )
 
-        print(
-            "-" * 60
-        )
+        print("-" * 60)
 
 
 # ==========================================================
-# SELECT TEST LOCATION
+# SELECT ACTUAL LOCATION
 # ==========================================================
 
 def select_location():
@@ -342,15 +361,16 @@ def select_location():
 
         print()
         print("=" * 60)
+
         print(
-            "ECHODESK LOCATION TEST"
+            "ECHODESK LIVE LOCATION TEST"
         )
+
         print("=" * 60)
 
         print()
         print(
-            "Which side are you "
-            "going to tap?"
+            "Which side will you tap?"
         )
 
         print()
@@ -372,13 +392,16 @@ def select_location():
 
             return "left"
 
-        if choice == "2":
+        elif choice == "2":
 
             return "right"
 
-        print(
-            "Invalid option."
-        )
+        else:
+
+            print()
+            print(
+                "Invalid option."
+            )
 
 
 # ==========================================================
@@ -386,6 +409,10 @@ def select_location():
 # ==========================================================
 
 def main():
+
+    # ------------------------------------------------------
+    # Select actual test side
+    # ------------------------------------------------------
 
     actual_location = (
         select_location()
@@ -395,7 +422,7 @@ def main():
     print("=" * 60)
 
     print(
-        f"TESTING: "
+        f"TESTING ACTUAL LOCATION: "
         f"{actual_location.upper()}"
     )
 
@@ -403,37 +430,46 @@ def main():
 
     print()
     print(
-        "All taps in this session "
-        "should be on the:"
-    )
-
-    print()
-    print(
-        f">>> "
-        f"{actual_location.upper()} "
-        f"SIDE <<<"
+        "Stay quiet during "
+        "the 2-second calibration."
     )
 
     print()
 
     print(
-        "Stay quiet for "
-        "2 seconds during calibration."
+        "When ECHODESK READY appears,"
+    )
+
+    print(
+        f"tap ONLY the "
+        f"{actual_location.upper()} side."
     )
 
     print()
 
-    # ======================================================
-    # CREATE TEST SYSTEM
-    # ======================================================
+    print(
+        "Recommended: 20 taps."
+    )
+
+    print()
+
+    print(
+        "Press Ctrl+C when finished."
+    )
+
+    print()
+
+    # ------------------------------------------------------
+    # Create test system
+    # ------------------------------------------------------
 
     echodesk = EchoDeskTest(
         actual_location
     )
 
-    # ======================================================
-    # START MICROPHONE
-    # ======================================================
+    # ------------------------------------------------------
+    # Open microphone stream
+    # ------------------------------------------------------
 
     stream = sd.InputStream(
 
@@ -471,7 +507,7 @@ def main():
 
         print()
         print(
-            "Stopping test..."
+            "Stopping location test..."
         )
 
     finally:
@@ -481,14 +517,16 @@ def main():
         stream.close()
 
         # ==================================================
-        # FINAL RESULTS
+        # FINAL TEST RESULTS
         # ==================================================
 
         print()
         print("=" * 60)
+
         print(
             "LOCATION TEST RESULTS"
         )
+
         print("=" * 60)
 
         print()
@@ -534,12 +572,14 @@ def main():
         print()
 
         print(
-            "Test results:"
+            "Detailed results saved to:"
         )
 
         print(
-            TEST_LOG_FILE
+            LOG_FILE
         )
+
+        print()
 
         print("=" * 60)
 
