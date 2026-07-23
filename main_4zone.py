@@ -2,6 +2,7 @@ import time
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 import sounddevice as sd
 
@@ -14,6 +15,9 @@ from main import (
 )
 
 from dsp.stereo_features import extract_stereo_features
+
+from actions.dispatcher import execute
+from actions.gesture_manager import GestureManager
 
 
 # ==========================================================
@@ -37,7 +41,10 @@ class EchoDesk4Zone(EchoDesk):
 
     def __init__(self):
 
-        # Load normal EchoDesk system
+        # ==================================================
+        # INITIALIZE NORMAL ECHODESK
+        # ==================================================
+
         super().__init__()
 
         print()
@@ -45,9 +52,9 @@ class EchoDesk4Zone(EchoDesk):
         print("Loading EchoDesk 4-Zone Model")
         print("=" * 60)
 
-        # --------------------------------------------------
-        # Check model files
-        # --------------------------------------------------
+        # ==================================================
+        # CHECK MODEL FILES
+        # ==================================================
 
         if not ZONE_MODEL_PATH.exists():
 
@@ -63,9 +70,9 @@ class EchoDesk4Zone(EchoDesk):
                 f"{ZONE_FEATURES_PATH}"
             )
 
-        # --------------------------------------------------
-        # Load model
-        # --------------------------------------------------
+        # ==================================================
+        # LOAD MODEL
+        # ==================================================
 
         self.zone_model = joblib.load(
             ZONE_MODEL_PATH
@@ -84,9 +91,9 @@ class EchoDesk4Zone(EchoDesk):
             f"{len(self.zone_feature_names)}"
         )
 
-        # --------------------------------------------------
-        # Zone statistics
-        # --------------------------------------------------
+        # ==================================================
+        # ZONE STATISTICS
+        # ==================================================
 
         self.zone_counts = {
 
@@ -100,9 +107,25 @@ class EchoDesk4Zone(EchoDesk):
 
         }
 
-        # Latest 4-zone result
+        # ==================================================
+        # LATEST 4-ZONE RESULT
+        # ==================================================
 
         self.latest_zone_result = None
+
+        # ==================================================
+        # SINGLE / DOUBLE TAP MANAGER
+        # ==================================================
+
+        self.gesture_manager = GestureManager(
+            execute
+        )
+
+        print(
+            "Single / double tap manager loaded."
+        )
+
+        print()
 
 
     # ======================================================
@@ -112,23 +135,18 @@ class EchoDesk4Zone(EchoDesk):
     def finish_event(self):
 
         # --------------------------------------------------
-        # IMPORTANT
-        #
-        # We need access to the original stereo event before
-        # the parent EchoDesk resets event_buffer.
+        # Make sure event exists
         # --------------------------------------------------
 
         if not self.event_buffer:
 
             return
 
+        # ==================================================
+        # COPY STEREO EVENT
+        # ==================================================
+
         try:
-
-            # --------------------------------------------------
-            # Build copy of stereo event
-            # --------------------------------------------------
-
-            import numpy as np
 
             stereo_event = np.concatenate(
                 self.event_buffer,
@@ -140,7 +158,9 @@ class EchoDesk4Zone(EchoDesk):
                 :2
             ]
 
-            # Pad short event if necessary
+            # --------------------------------------------------
+            # Pad short events
+            # --------------------------------------------------
 
             if (
                 len(stereo_event)
@@ -155,47 +175,56 @@ class EchoDesk4Zone(EchoDesk):
                 stereo_event = np.pad(
                     stereo_event,
                     (
-                        (0, missing),
-                        (0, 0)
+                        (
+                            0,
+                            missing
+                        ),
+                        (
+                            0,
+                            0
+                        )
                     )
                 )
 
         except Exception as error:
 
             print()
-            print(
-                "ERROR COPYING STEREO EVENT:"
-            )
+            print("=" * 60)
 
             print(
-                error
+                "ERROR COPYING STEREO EVENT"
             )
 
-            # Let normal EchoDesk clean up
+            print("=" * 60)
+
+            print(
+                f"{type(error).__name__}: "
+                f"{error}"
+            )
+
+            # Allow parent system to clean up
 
             super().finish_event()
 
             return
 
-        # --------------------------------------------------
-        # Run normal EchoDesk processing
-        #
-        # This performs:
-        #
-        # impulse
-        #   ↓
-        # tap classifier
-        #   ↓
-        # LEFT / RIGHT classifier
-        #
-        # It also sets self.latest_result.
-        # --------------------------------------------------
+        # ==================================================
+        # RUN NORMAL TAP PIPELINE
+        # ==================================================
 
         super().finish_event()
 
         # --------------------------------------------------
-        # If event was rejected as NOT TAP,
-        # don't run 4-zone classifier.
+        # Parent EchoDesk performs:
+        #
+        # candidate detection
+        #       ↓
+        # tap / non-tap classifier
+        #       ↓
+        # LEFT / RIGHT classifier
+        #
+        # If rejected:
+        # latest_result == None
         # --------------------------------------------------
 
         if (
@@ -218,9 +247,9 @@ class EchoDesk4Zone(EchoDesk):
                 )
             )
 
-            # --------------------------------------------------
-            # Build model input in exact training feature order
-            # --------------------------------------------------
+            # ==================================================
+            # BUILD MODEL INPUT
+            # ==================================================
 
             row = {
 
@@ -256,7 +285,7 @@ class EchoDesk4Zone(EchoDesk):
             ).lower()
 
             # ==================================================
-            # CLASS PROBABILITIES
+            # PROBABILITIES
             # ==================================================
 
             probabilities = {}
@@ -273,7 +302,10 @@ class EchoDesk4Zone(EchoDesk):
                     )[0]
                 )
 
-                for zone, probability in zip(
+                for (
+                    zone,
+                    probability
+                ) in zip(
 
                     self.zone_model.classes_,
 
@@ -288,7 +320,7 @@ class EchoDesk4Zone(EchoDesk):
                     )
 
             # ==================================================
-            # PREDICTION CONFIDENCE
+            # CONFIDENCE
             # ==================================================
 
             confidence = (
@@ -318,7 +350,7 @@ class EchoDesk4Zone(EchoDesk):
             }
 
             # ==================================================
-            # UPDATE COUNTERS
+            # UPDATE ZONE COUNTERS
             # ==================================================
 
             if (
@@ -331,7 +363,7 @@ class EchoDesk4Zone(EchoDesk):
                 ] += 1
 
             # ==================================================
-            # DISPLAY
+            # DISPLAY 4-ZONE RESULT
             # ==================================================
 
             print()
@@ -346,63 +378,87 @@ class EchoDesk4Zone(EchoDesk):
             print()
 
             # --------------------------------------------------
-            # Visual zone result
+            # TOP LEFT
             # --------------------------------------------------
 
-            if prediction == "top_left":
+            if (
+                prediction
+                == "top_left"
+            ):
 
                 print(
-                    "X TOP LEFT    |   TOP RIGHT"
+                    "X TOP LEFT     |   TOP RIGHT"
                 )
 
                 print(
-                    "--------------+--------------"
+                    "---------------+---------------"
                 )
 
                 print(
-                    "  BOTTOM LEFT |   BOTTOM RIGHT"
+                    "  BOTTOM LEFT  |   BOTTOM RIGHT"
                 )
 
-            elif prediction == "top_right":
+            # --------------------------------------------------
+            # TOP RIGHT
+            # --------------------------------------------------
+
+            elif (
+                prediction
+                == "top_right"
+            ):
 
                 print(
-                    "  TOP LEFT    | X TOP RIGHT"
-                )
-
-                print(
-                    "--------------+--------------"
-                )
-
-                print(
-                    "  BOTTOM LEFT |   BOTTOM RIGHT"
-                )
-
-            elif prediction == "bottom_left":
-
-                print(
-                    "  TOP LEFT    |   TOP RIGHT"
+                    "  TOP LEFT     | X TOP RIGHT"
                 )
 
                 print(
-                    "--------------+--------------"
+                    "---------------+---------------"
                 )
 
                 print(
-                    "X BOTTOM LEFT |   BOTTOM RIGHT"
+                    "  BOTTOM LEFT  |   BOTTOM RIGHT"
                 )
 
-            elif prediction == "bottom_right":
+            # --------------------------------------------------
+            # BOTTOM LEFT
+            # --------------------------------------------------
+
+            elif (
+                prediction
+                == "bottom_left"
+            ):
 
                 print(
-                    "  TOP LEFT    |   TOP RIGHT"
+                    "  TOP LEFT     |   TOP RIGHT"
                 )
 
                 print(
-                    "--------------+--------------"
+                    "---------------+---------------"
                 )
 
                 print(
-                    "  BOTTOM LEFT | X BOTTOM RIGHT"
+                    "X BOTTOM LEFT  |   BOTTOM RIGHT"
+                )
+
+            # --------------------------------------------------
+            # BOTTOM RIGHT
+            # --------------------------------------------------
+
+            elif (
+                prediction
+                == "bottom_right"
+            ):
+
+                print(
+                    "  TOP LEFT     |   TOP RIGHT"
+                )
+
+                print(
+                    "---------------+---------------"
+                )
+
+                print(
+                    "  BOTTOM LEFT  | X BOTTOM RIGHT"
                 )
 
             else:
@@ -434,7 +490,7 @@ class EchoDesk4Zone(EchoDesk):
                 )
 
             # ==================================================
-            # ALL PROBABILITIES
+            # ALL ZONE PROBABILITIES
             # ==================================================
 
             if probabilities:
@@ -472,15 +528,12 @@ class EchoDesk4Zone(EchoDesk):
                     ):
 
                         print(
-
                             f"{zone.upper():15} "
-
                             f"{probability * 100:6.2f}%"
-
                         )
 
             # ==================================================
-            # COUNTERS
+            # ZONE COUNTERS
             # ==================================================
 
             print()
@@ -514,6 +567,25 @@ class EchoDesk4Zone(EchoDesk):
 
             print("=" * 60)
 
+            # ==================================================
+            # REGISTER TAP WITH GESTURE MANAGER
+            #
+            # IMPORTANT:
+            #
+            # We DO NOT execute the action directly here.
+            #
+            # GestureManager waits to determine whether this
+            # is a SINGLE or DOUBLE tap.
+            # ==================================================
+
+            self.gesture_manager.register_tap(
+                prediction
+            )
+
+        # ==================================================
+        # MISSING FEATURE
+        # ==================================================
+
         except KeyError as error:
 
             print()
@@ -526,14 +598,16 @@ class EchoDesk4Zone(EchoDesk):
             print("=" * 60)
 
             print(
-                "The model expects a feature "
-                "that stereo_features.py did "
-                "not return:"
+                "Missing feature:"
             )
 
             print(
                 error
             )
+
+        # ==================================================
+        # GENERAL ERROR
+        # ==================================================
 
         except Exception as error:
 
@@ -568,7 +642,7 @@ def main():
     print("=" * 60)
 
     # ======================================================
-    # MICROPHONE INFO
+    # MICROPHONE INFORMATION
     # ======================================================
 
     device_info = sd.query_devices(
@@ -605,8 +679,26 @@ def main():
         "2 seconds during calibration..."
     )
 
+    print()
+
+    print(
+        "After ECHODESK READY:"
+    )
+
+    print()
+
+    print(
+        "Single tap  = one action"
+    )
+
+    print(
+        "Double tap  = second action"
+    )
+
+    print()
+
     # ======================================================
-    # START STREAM
+    # START MICROPHONE STREAM
     # ======================================================
 
     stream = sd.InputStream(
@@ -633,6 +725,10 @@ def main():
 
     stream.start()
 
+    # ======================================================
+    # KEEP SYSTEM RUNNING
+    # ======================================================
+
     try:
 
         while True:
@@ -645,7 +741,7 @@ def main():
 
         print()
         print(
-            "Stopping EchoDesk 4-Zone..."
+            "Stopping EchoDesk..."
         )
 
     finally:
@@ -662,7 +758,7 @@ def main():
         print("=" * 60)
 
         print(
-            "4-ZONE SESSION SUMMARY"
+            "ECHODESK SESSION SUMMARY"
         )
 
         print("=" * 60)
@@ -687,6 +783,14 @@ def main():
         print()
 
         print(
+            "4-ZONE COUNTS"
+        )
+
+        print(
+            "-" * 40
+        )
+
+        print(
             f"TOP LEFT:     "
             f"{echodesk.zone_counts['top_left']}"
         )
@@ -707,7 +811,6 @@ def main():
         )
 
         print()
-
         print("=" * 60)
 
 
